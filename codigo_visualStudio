@@ -1,0 +1,730 @@
+/*
+ * INDICE (donde esta cada cosa)
+ *  1. Variables
+ *  2. Conexion con el servidor:   ConectarServidor, EnviarAlServidor, AtenderServidor (el THREAD), ConexionPerdida
+ *  3. Mensajes del servidor:      ProcesarMensaje (aqui se decide que hacer con cada codigo) y una funcion por mensaje:
+ *                                 RespuestaRegistro, RespuestaLogin, PonConectados, RecibirInvitacion,
+ *                                 ResultadoInvitacion, PintarEstado, FinPartida
+ *  4. Botones:                    Registrarse, Iniciar sesion, Invitar, Iniciar partida, Consultar, Enviar (chat), cerrar ventana
+ *  5. Tablero:                    ConfigurarTablero, AjustarTablero (para que quepa en pantalla), PintaCelda, LimpiarTablero,
+ *                                 TableroDataGridView_CellClick
+ */
+
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Text;
+using System.Windows.Forms;
+using System.Net;
+using System.Net.Sockets;
+using System.Threading;
+
+namespace InterfazZombieApocalipsis
+{
+    public partial class InterfazForm : Form
+    {
+        /// ---------------------------------------------------------------
+        /// 1. VARIABLES
+        /// ---------------------------------------------------------------
+
+        //Socket y Thread
+        Socket server;
+        Thread atender;
+
+        // Encapsulará la función que queremos ejecutar en el hilo de la interfaz (L5.2 ejercicio guía)
+        delegate void DelegadoParaProcesar(string mensaje);
+
+        const int PUERTO = 50000; // El puerto del servidor C
+        IPAddress ip = IPAddress.Parse("10.4.119.6");    //Para Shiva (o la VM) poned aquí su IP
+
+        //Tamaño del tablero (tiene que ser igual que COLUMNAS y FILAS del servidor)
+        const int COLUMNAS = 30;
+        const int FILAS = 34;
+
+        //Datos del cliente
+        string NombreCliente = "";      //Nuestro nombre. Si está vacío es que todavía no hemos iniciado sesión
+        string nombrePendiente = "";    //El nombre que hemos mandado en el login (hasta que el servidor diga "Correcto")
+        bool cerrando = false;          //Para saber si se está cerrando la ventana
+
+        //Datos de la partida
+        int partidaActual = -1;         //Id de la partida en la que estamos (-1 si no hay ninguna)
+        string anfitrion = "";          //Nombre del jugador que ha invitado a todos
+        bool partidaIniciada = false;
+        string miTurno = "";            //Nombre del jugador al que le toca
+        int miX = -1;                   //Nuestra posición en el tablero
+        int miY = -1;
+        List<Point> celdasPintadas = new List<Point>();     //Casillas que tienen ficha (para borrarlas rápido)
+
+        public InterfazForm()
+        {
+            InitializeComponent();
+            //Estas dos cosas no están en el Designer, las hacemos aquí
+            this.FormClosing += new FormClosingEventHandler(InterfazForm_FormClosing);
+            this.Resize += new EventHandler(InterfazForm_Resize);                                            //Para recolocar el tablero si cambia la ventana
+            this.EnviarMensajeButton.Click += new EventHandler(EnviarMensajeButton_Click);                   //Botón del chat
+            ConectadosListBox.SelectionMode = SelectionMode.MultiExtended;     //Para poder invitar a varios a la vez (Ctrl + clic)
+        }
+
+        private void InterfazForm_Load(object sender, EventArgs e)
+        {
+            //Si la ventana es más grande que la pantalla la maximizamos, así todo se ve
+            Rectangle pantalla = Screen.FromControl(this).WorkingArea;
+            if (this.Width > pantalla.Width || this.Height > pantalla.Height)
+                this.WindowState = FormWindowState.Maximized;
+
+            // Tablero
+            ConfigurarTablero();
+        }
+
+        // Cada vez que cambia el tamaño de la ventana volvemos a ajustar el tablero
+        private void InterfazForm_Resize(object sender, EventArgs e)
+        {
+            if (TableroDataGridView.ColumnCount == COLUMNAS)    //Solo si el tablero ya está configurado
+                AjustarTablero();
+        }
+
+
+        /// ---------------------------------------------------------------
+        /// 2. CONEXIÓN CON EL SERVIDOR
+        /// ---------------------------------------------------------------
+
+        // Nos conectamos al servidor C (si no lo estábamos ya) y arrancamos el thread que atiende sus mensajes
+        private bool ConectarServidor()
+        {
+            if (server != null && server.Connected)
+                return true;
+
+            try
+            {
+                IPEndPoint ipep = new IPEndPoint(ip, PUERTO);
+                server = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                server.Connect(ipep);
+
+                //Poner en marcha el thread que atenderá los mensajes del servidor
+                ThreadStart ts = delegate { AtenderServidor(); };
+                atender = new Thread(ts);
+                atender.IsBackground = true;    //Así el thread se cierra solo al cerrar la ventana
+                atender.Start();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("No se pudo conectar con el servidor: " + ex.Message, "Error de red", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return false;
+            }
+        }
+
+        // Manda un mensaje al servidor (le ponemos un '\n' al final para que el servidor separe los mensajes)
+        private void EnviarAlServidor(string mensaje)
+        {
+            if (server == null || !server.Connected)
+            {
+                MessageBox.Show("No estás conectado al servidor. Inicia sesión primero.", "Atención", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            try
+            {
+                server.Send(Encoding.UTF8.GetBytes(mensaje + "\n"));
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Error al enviar al servidor: " + ex.Message, "Error de red", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        /// IMPORTANTE
+        /// Este es el THREAD que se encarga de recibir TODOS los mensajes del servidor
+        /// IMPORTANTE
+        private void AtenderServidor()
+        {
+            Socket socket = server;
+            byte[] buffer = new byte[4096];
+
+            while (true)
+            {
+                int bytesRecibidos;
+                try
+                {
+                    //Recibimos lo que manda el servidor C (se queda esperando aquí hasta que llega algo)
+                    bytesRecibidos = socket.Receive(buffer);
+                }
+                catch (Exception)
+                {
+                    bytesRecibidos = 0;
+                }
+                if (bytesRecibidos <= 0)
+                    break;      //El servidor ha cerrado la conexión
+
+                //Pueden llegar varios mensajes pegados: cada uno acaba en '\n', así que los separamos
+                string recibido = Encoding.UTF8.GetString(buffer, 0, bytesRecibidos);
+                string[] mensajes = recibido.Split('\n');
+                foreach (string mensaje in mensajes)
+                {
+                    if (mensaje != "")
+                    {
+                        try
+                        {
+                            //Un thread no puede tocar los controles de la ventana: le pedimos al hilo de la interfaz que ejecute ProcesarMensaje
+                            this.Invoke(new DelegadoParaProcesar(ProcesarMensaje), new object[] { mensaje });
+                        }
+                        catch (Exception)
+                        {
+                            return;     //La ventana ya se ha cerrado
+                        }
+                    }
+                }
+            }
+
+            //Si llegamos aquí es que se ha perdido la conexión
+            if (!cerrando)
+            {
+                try
+                {
+                    this.Invoke(new DelegadoParaProcesar(ConexionPerdida), new object[] { "" });
+                }
+                catch (Exception)
+                {
+                }
+            }
+        }
+
+        // Se ha perdido la conexión: lo dejamos todo como al principio
+        private void ConexionPerdida(string mensaje)
+        {
+            server = null;
+            NombreCliente = "";
+            partidaActual = -1;
+            partidaIniciada = false;
+            ConectadosListBox.Items.Clear();
+            PartidasListBox.Items.Clear();
+            LimpiarTablero();
+            BloqueaLogin(false);
+            MessageBox.Show("Se ha perdido la conexión con el servidor.", "Error de red", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+
+
+        /// ---------------------------------------------------------------
+        /// 3. MENSAJES DEL SERVIDOR (ya estamos en el hilo de la interfaz, aquí sí podemos tocar los controles)
+        /// ---------------------------------------------------------------
+
+        public void PonRespuesta(string mensaje)
+        {
+            RespuestasServidorLabel.Text = mensaje;
+        }
+
+        // Devuelve las partes del mensaje desde la posición "desde" volviendo a unirlas con '/'
+        private static string Resto(string[] partes, int desde)
+        {
+            if (desde >= partes.Length)
+                return "";
+            return string.Join("/", partes, desde, partes.Length - desde);
+        }
+
+        // Aquí llega CADA mensaje del servidor y según su código llamamos a una función u otra
+        private void ProcesarMensaje(string mensaje)
+        {
+            try
+            {
+                string[] partes = mensaje.Split('/');
+                int codigo = Convert.ToInt32(partes[0]);
+
+                switch (codigo)
+                {
+                    case 1: RespuestaRegistro(partes); break;       //1/OK|NO/mensaje
+                    case 2: RespuestaLogin(partes); break;          //2/Correcto|NO/mensaje
+                    case 3:                                         //3/SI|NO|ERROR/mensaje
+                        PonRespuesta("Consulta pistola: " + Resto(partes, 2));
+                        break;
+                    case 4:                                         //4/numero
+                        if (partes[1] == "ERROR")
+                            PonRespuesta("Error: " + Resto(partes, 2));
+                        else
+                            PonRespuesta("Número de jugadores: " + partes[1]);
+                        break;
+                    case 5:                                         //5/jugador-tiempo
+                        if (partes[1] == "ERROR")
+                            PonRespuesta("Error: " + Resto(partes, 2));
+                        else
+                            PonRespuesta("Jugador con más tiempo: " + partes[1]);
+                        break;
+                    case 6: PonConectados(partes); break;           //6/n/nombre1/nombre2... (se actualiza SIEMPRE, solo)
+                    case 7: RecibirInvitacion(partes); break;       //7/id/anfitrion
+                    case 8: ResultadoInvitacion(partes); break;     //8/id/Si/jugadores...  o  8/id/No/rechazan...
+                    case 9: PintarEstado(partes); break;            //9/id/turno/zx/zy/n/(nombre/x/y/vivo)...
+                    case 10: FinPartida(partes); break;             //10/id/Victoria|Derrota
+                    case 11:                                        //11/mensaje de error
+                        MessageBox.Show(Resto(partes, 1), "Atención", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        break;
+                    case 12: PonRespuesta(Resto(partes, 1)); break; //12/mensaje de información
+                    case 13:                                        //13/jugador/texto (chat)
+                        ChatListBox.Items.Add(partes[1] + ": " + Resto(partes, 2));
+                        ChatListBox.TopIndex = ChatListBox.Items.Count - 1;     //Para que se vea siempre el último mensaje
+                        break;
+                }
+            }
+            catch (Exception)
+            {
+                PonRespuesta("Mensaje inesperado del servidor: " + mensaje);
+            }
+        }
+
+        private void RespuestaRegistro(string[] partes)
+        {
+            string mensaje = Resto(partes, 2);
+            PonRespuesta("Respuesta de registro: " + mensaje);
+            if (partes[1] != "OK")
+                MessageBox.Show(mensaje, "Error de registro", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
+        private void RespuestaLogin(string[] partes)
+        {
+            string mensaje = Resto(partes, 2);
+            if (partes[1] == "Correcto")
+            {
+                NombreCliente = nombrePendiente;    //Ahora sí: ya tenemos sesión
+                BloqueaLogin(true);
+                PonRespuesta("Sesión iniciada como " + NombreCliente);
+            }
+            else
+            {
+                nombrePendiente = "";
+                PonRespuesta("Respuesta de inicio de sesión: " + mensaje);
+                MessageBox.Show(mensaje, "Error de inicio de sesión", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        // Bloquea (o desbloquea) los controles del login
+        private void BloqueaLogin(bool bloquear)
+        {
+            NombreTextBox.Enabled = !bloquear;
+            ConTextBox.Enabled = !bloquear;
+            IniciarSesionButton.Enabled = !bloquear;
+            RegistraButton.Enabled = !bloquear;
+        }
+
+        // Mensaje 6: la lista de conectados llega SOLA cada vez que cambia
+        public void PonConectados(string[] partes)
+        {
+            ConectadosListBox.Items.Clear();
+            for (int i = 2; i < partes.Length; i++)
+            {
+                string nombreLimpio = partes[i].Split('\0')[0];
+                if (!string.IsNullOrWhiteSpace(nombreLimpio))
+                    ConectadosListBox.Items.Add(nombreLimpio);
+            }
+        }
+
+        /// VERSION 4: PROTOCOLO DE INVITACIÓN (parte del invitado)
+        // Mensaje 7: "7/id/anfitrion" -> nos han invitado. Se lo mostramos al usuario y mandamos su respuesta
+        private void RecibirInvitacion(string[] partes)
+        {
+            string id = partes[1];
+            string invitador = partes[2];
+
+            DialogResult respuesta = MessageBox.Show(invitador + " te invita a jugar una partida. Aceptas?",
+                "Invitación de partida", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+
+            if (respuesta == DialogResult.Yes)
+            {
+                EnviarAlServidor("8/" + id + "/Si");
+                PonRespuesta("Has aceptado la invitación de " + invitador + ". Esperando al resto de jugadores...");
+            }
+            else
+            {
+                EnviarAlServidor("8/" + id + "/No");
+                PonRespuesta("Has rechazado la invitación de " + invitador + ".");
+            }
+        }
+
+        /// VERSION 4: PROTOCOLO DE INVITACIÓN (resultado, lo reciben el anfitrión Y los invitados)
+        // Mensaje 8: "8/id/Si/jugadores..." (todos aceptaron, se juega)  o  "8/id/No/rechazan..." (no se juega)
+        private void ResultadoInvitacion(string[] partes)
+        {
+            string id = partes[1];
+            string nombres = string.Join(", ", partes, 3, partes.Length - 3);   //Los nombres que vienen después del Si/No
+
+            if (partes[2] == "Si")
+            {
+                partidaActual = Convert.ToInt32(id);
+                anfitrion = partes[3];      //El primer nombre de la lista es el anfitrión
+                PartidasListBox.Items.Clear();
+                PartidasListBox.Items.Add("Partida " + id + " | Jugadores: " + nombres);
+
+                string aviso = "Todos han aceptado la invitación, se jugará la partida!\nJugadores: " + nombres;
+                if (NombreCliente == anfitrion)
+                    aviso = aviso + "\n\nPulsa 'Iniciar partida' cuando quieras empezar.";
+                else
+                    aviso = aviso + "\n\nEspera a que " + anfitrion + " inicie la partida.";
+                PonRespuesta("Todos han aceptado. ¡Se jugará la partida!");
+                MessageBox.Show(aviso, "Resultado de la invitación", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            else
+            {
+                partidaActual = -1;
+                anfitrion = "";
+                PartidasListBox.Items.Clear();
+                PonRespuesta("No se jugará la partida: " + nombres + " ha rechazado la invitación.");
+                MessageBox.Show("No se jugará la partida porque ha rechazado la invitación: " + nombres,
+                    "Resultado de la invitación", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+        }
+
+        // Mensaje 9: "9/id/turno/zx/zy/n/nombre/x/y/vivo/..." -> el servidor nos manda el tablero completo y lo dibujamos
+        private void PintarEstado(string[] partes)
+        {
+            partidaActual = Convert.ToInt32(partes[1]);
+            miTurno = partes[2];
+            int zx = Convert.ToInt32(partes[3]);
+            int zy = Convert.ToInt32(partes[4]);
+            int n = Convert.ToInt32(partes[5]);
+
+            partidaIniciada = true;
+            LimpiarTablero();
+            PintaCelda(zx, zy, "Z", Color.Firebrick, Color.White);      //El zombie, en rojo
+
+            bool yoVivo = false;
+            for (int k = 0; k < n; k++)
+            {
+                int pos = 6 + 4 * k;        //Cada jugador ocupa 4 partes: nombre, x, y, vivo
+                string nombre = partes[pos];
+                int x = Convert.ToInt32(partes[pos + 1]);
+                int y = Convert.ToInt32(partes[pos + 2]);
+                bool vivo = (partes[pos + 3] == "1");
+
+                if (nombre == NombreCliente)
+                {
+                    miX = x;
+                    miY = y;
+                    yoVivo = vivo;
+                }
+                if (vivo)
+                {
+                    //Los jugadores se escriben con la primera letra de su nombre (el nuestro, en dorado)
+                    Color fondo = Color.LightGreen;
+                    if (nombre == NombreCliente)
+                        fondo = Color.Gold;
+                    PintaCelda(x, y, nombre.Substring(0, 1).ToUpper(), fondo, Color.Black);
+                }
+            }
+            TableroDataGridView.ClearSelection();
+
+            if (!yoVivo)
+                PonRespuesta("Te han atrapado. Sigue la partida como espectador.");
+            else if (miTurno == NombreCliente)
+                PonRespuesta("¡Es tu turno! Haz clic en una casilla adyacente (arriba, abajo, izquierda o derecha).");
+            else
+                PonRespuesta("Turno de " + miTurno + "...");
+        }
+
+        // Mensaje 10: "10/id/Victoria" o "10/id/Derrota" -> se acabó la partida
+        private void FinPartida(string[] partes)
+        {
+            partidaIniciada = false;
+            partidaActual = -1;
+            anfitrion = "";
+            miTurno = "";
+            LimpiarTablero();
+            PartidasListBox.Items.Clear();
+
+            if (partes[2] == "Victoria")
+                MessageBox.Show("¡Habéis sobrevivido a todas las rondas!", "¡Victoria!", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            else
+                MessageBox.Show("El zombie ha acabado con todos los jugadores.", "Fin de la partida", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+
+        /// ---------------------------------------------------------------
+        /// 4. BOTONES
+        /// ---------------------------------------------------------------
+
+        // Comprueba usuario y contraseña antes de mandarlos
+        private bool DatosValidos()
+        {
+            string usuario = NombreTextBox.Text.Trim();
+            if (usuario == "" || ConTextBox.Text == "")
+            {
+                MessageBox.Show("Por favor, introduce usuario y contraseña.", "Atención", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
+            }
+            if (usuario.Length > 19 || ConTextBox.Text.Length > 29)
+            {
+                MessageBox.Show("El usuario puede tener como máximo 19 caracteres y la contraseña 29.", "Atención", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
+            }
+            if (usuario.Contains("-") || usuario.Contains("/"))
+            {
+                MessageBox.Show("El nombre de usuario no puede contener '-' ni '/'.", "Atención", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
+            }
+            return true;
+        }
+
+        // BOTÓN REGISTRARSE (se conecta solo y envía el registro)
+        private void RegistraButton_Click_1(object sender, EventArgs e)
+        {
+            if (!DatosValidos())
+                return;
+            if (!ConectarServidor())
+                return;
+
+            // Enviamos formato de registro: 1/usuario-contraseña
+            EnviarAlServidor("1/" + NombreTextBox.Text.Trim() + "-" + ConTextBox.Text);
+        }
+
+        // BOTÓN INICIAR SESIÓN (se conecta solo y envía el login)
+        private void IniciarSesionButton_Click(object sender, EventArgs e)
+        {
+            if (NombreCliente != "")
+            {
+                MessageBox.Show("Ya has iniciado sesión como " + NombreCliente + ".", "Atención", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            if (!DatosValidos())
+                return;
+            if (!ConectarServidor())
+                return;
+
+            // Enviamos los datos en el formato del protocolo: 2/usuario-contraseña
+            nombrePendiente = NombreTextBox.Text.Trim();
+            EnviarAlServidor("2/" + nombrePendiente + "-" + ConTextBox.Text);
+        }
+
+        // DESCONECTAR AL CERRAR LA VENTANA
+        private void InterfazForm_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            cerrando = true;
+            try
+            {
+                if (server != null && server.Connected)
+                {
+                    server.Send(Encoding.UTF8.GetBytes("0/\n"));    //Código 0: nos desconectamos
+                    server.Close();
+                }
+            }
+            catch (Exception)
+            {
+            }
+        }
+
+        /// VERSION 4: PROTOCOLO DE INVITACIÓN (parte del anfitrión)
+        // BOTÓN INVITAR: invitamos a los jugadores que estén seleccionados en la lista de conectados (Ctrl + clic para varios)
+        private void InivitarButton_Click(object sender, EventArgs e)
+        {
+            if (NombreCliente == "")
+            {
+                MessageBox.Show("Inicia sesión antes de invitar a alguien.", "Atención", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            if (ConectadosListBox.SelectedItems.Count == 0)
+            {
+                MessageBox.Show("Selecciona uno o varios jugadores de la lista de conectados.", "Atención", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            // Formato de la petición: 7/invitado1/invitado2/...
+            string mensaje = "7";
+            foreach (object seleccionado in ConectadosListBox.SelectedItems)
+            {
+                string invitado = seleccionado.ToString();
+                if (invitado == NombreCliente)
+                {
+                    MessageBox.Show("No puedes invitarte a ti mismo.", "Atención", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+                mensaje = mensaje + "/" + invitado;
+            }
+            EnviarAlServidor(mensaje);
+            //Las respuestas llegarán por el thread (mensajes 12, 11 y 8)
+        }
+
+        // BOTÓN INICIAR PARTIDA: solo se lo pedimos al servidor, él decide dónde aparece cada uno
+        private void IniciarPartidaButton_Click(object sender, EventArgs e)
+        {
+            if (partidaActual == -1)
+            {
+                MessageBox.Show("Todavía no tienes una partida lista. Invita a otros jugadores y espera a que todos acepten.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            if (partidaIniciada)
+            {
+                MessageBox.Show("La partida ya está en marcha.", "Atención", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            if (NombreCliente != anfitrion)
+            {
+                MessageBox.Show("Solo el anfitrión (" + anfitrion + ") puede iniciar la partida.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            // Petición: 9/id
+            EnviarAlServidor("9/" + partidaActual);
+        }
+
+        // BOTÓN CONSULTAR (peticiones 3, 4 y 5)
+        private void ConsultarButton_Click_1(object sender, EventArgs e)
+        {
+            int codigoConsulta;
+            string parametro;
+
+            if (PistolaRadioButton.Checked)
+            {
+                codigoConsulta = 3;
+                parametro = JugadorTextBox.Text.Trim();
+                if (parametro == "")
+                {
+                    MessageBox.Show("Introduce el nombre del jugador.", "Atención", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+            }
+            else if (NumJugadoresRadioButton.Checked || MasTiempoRadioButton.Checked)
+            {
+                if (NumJugadoresRadioButton.Checked)
+                    codigoConsulta = 4;
+                else
+                    codigoConsulta = 5;
+                parametro = PartidaTextBox.Text.Trim();
+                if (parametro == "")
+                {
+                    MessageBox.Show("Introduce el código de la partida.", "Atención", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+            }
+            else
+            {
+                MessageBox.Show("Selecciona una de las opciones de consulta.", "Atención", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            EnviarAlServidor(codigoConsulta + "/" + parametro);
+        }
+
+        // BOTÓN ENVIAR (chat): mandamos el texto al servidor y él se lo reenvía a todos los de nuestra partida
+        private void EnviarMensajeButton_Click(object sender, EventArgs e)
+        {
+            string texto = MensajeTextBox.Text.Trim();
+            if (texto == "")
+                return;
+            if (NombreCliente == "")
+            {
+                MessageBox.Show("Inicia sesión para usar el chat.", "Atención", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            EnviarAlServidor("13/" + texto);    // Petición: 13/texto
+            MensajeTextBox.Clear();
+        }
+
+        //No hace nada
+        private void label13_Click(object sender, EventArgs e)
+        {
+        }
+
+
+        /// ---------------------------------------------------------------
+        /// 5. TABLERO
+        /// ---------------------------------------------------------------
+
+        private void ConfigurarTablero()
+        {
+            TableroDataGridView.ReadOnly = true;
+            TableroDataGridView.ColumnCount = COLUMNAS;
+            TableroDataGridView.RowCount = FILAS;
+
+            TableroDataGridView.ScrollBars = ScrollBars.None;
+            TableroDataGridView.RowHeadersVisible = false;
+            TableroDataGridView.ColumnHeadersVisible = false;
+            TableroDataGridView.AllowUserToResizeColumns = false;
+            TableroDataGridView.AllowUserToResizeRows = false;
+
+            //En el Designer las casillas estaban en "AllCells" (se agrandan para que quepa el texto) y por eso el tablero se salía
+            //de la pantalla. Las ponemos fijas y el tamaño lo decidimos nosotros en AjustarTablero
+            TableroDataGridView.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None;
+            TableroDataGridView.AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.None;
+            TableroDataGridView.Anchor = AnchorStyles.Top | AnchorStyles.Left;      //Que no cambie de tamaño solo al mover la ventana
+
+            //Letra pequeña y centrada para que la inicial del jugador quepa en la casilla
+            TableroDataGridView.DefaultCellStyle.Padding = new Padding(0);
+            TableroDataGridView.DefaultCellStyle.Font = new Font("Microsoft Sans Serif", 7F, FontStyle.Bold);
+            TableroDataGridView.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+
+            AjustarTablero();
+        }
+
+        // Calcula el tamaño de las casillas para que las 30 columnas y las 34 filas se vean enteras en la ventana
+        private void AjustarTablero()
+        {
+            if (this.WindowState == FormWindowState.Minimized)
+                return;
+
+            //Espacio disponible: desde donde empieza el tablero hasta el borde derecho de la ventana,
+            //y hacia abajo hasta el panel4 (que está justo debajo del tablero)
+            int ancho = this.ClientSize.Width - TableroDataGridView.Left - 10;
+            int alto = panel4.Top - TableroDataGridView.Top - 5;
+
+            //Casillas cuadradas: el lado es el más pequeño que hace que quepan todas
+            int lado = Math.Min(ancho / COLUMNAS, alto / FILAS);
+            if (lado < 4)
+                lado = 4;
+
+            for (int j = 0; j < COLUMNAS; j++)
+                TableroDataGridView.Columns[j].Width = lado;
+            for (int i = 0; i < FILAS; i++)
+                TableroDataGridView.Rows[i].Height = lado;
+
+            //El control se ajusta justo al tamaño de las casillas (+2 por el borde)
+            TableroDataGridView.Width = lado * COLUMNAS + 2;
+            TableroDataGridView.Height = lado * FILAS + 2;
+        }
+
+        // Escribe una ficha en una casilla y la colorea
+        private void PintaCelda(int x, int y, string texto, Color fondo, Color letra)
+        {
+            DataGridViewCell celda = TableroDataGridView.Rows[y].Cells[x];
+            celda.Value = texto;
+            celda.Style.BackColor = fondo;
+            celda.Style.SelectionBackColor = fondo;     //Para que no se ponga azul al hacer clic
+            celda.Style.ForeColor = letra;
+            celda.Style.SelectionForeColor = letra;
+            celdasPintadas.Add(new Point(x, y));
+        }
+
+        // Quita todas las fichas del tablero
+        private void LimpiarTablero()
+        {
+            foreach (Point p in celdasPintadas)
+            {
+                DataGridViewCell celda = TableroDataGridView.Rows[p.Y].Cells[p.X];
+                celda.Value = null;
+                celda.Style.BackColor = Color.Empty;
+                celda.Style.SelectionBackColor = Color.Empty;
+                celda.Style.ForeColor = Color.Empty;
+                celda.Style.SelectionForeColor = Color.Empty;
+            }
+            celdasPintadas.Clear();
+            TableroDataGridView.ClearSelection();
+        }
+
+        // CLIC EN EL TABLERO: pedimos al servidor mover nuestro jugador a esa casilla
+        private void TableroDataGridView_CellClick(object sender, DataGridViewCellEventArgs e)
+        {
+            if (!partidaIniciada || e.RowIndex < 0 || e.ColumnIndex < 0)
+                return;
+
+            int i = e.RowIndex;     // fila    (Y)
+            int j = e.ColumnIndex;  // columna (X)
+
+            if (miTurno != NombreCliente)
+            {
+                PonRespuesta("No es tu turno, espera a " + miTurno + ".");
+                return;
+            }
+            if (Math.Abs(miX - j) + Math.Abs(miY - i) != 1)
+            {
+                MessageBox.Show("Solo puedes moverte a una casilla adyacente (arriba, abajo, izquierda o derecha).", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            // Petición: 10/id/x/y
+            EnviarAlServidor("10/" + partidaActual + "/" + j + "/" + i);
+        }
+    }
+}
