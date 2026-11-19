@@ -33,7 +33,7 @@
 
 /* ---------------- 1. CONSTANTES Y ESTRUCTURAS ---------------- */
 
-#define PUERTO 9080			//Si lo cambiais aqui, cambiadlo tambien en el cliente
+#define PUERTO 50000			//Si lo cambiais aqui, cambiadlo tambien en el cliente
 #define COLUMNAS 30			//Tablero (tiene que ser igual que en el cliente)
 #define FILAS 34
 #define MAX_JUG 6			//Maximo de jugadores por partida
