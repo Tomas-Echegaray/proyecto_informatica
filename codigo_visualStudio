@@ -35,7 +35,7 @@ namespace InterfazZombieApocalipsis
         delegate void DelegadoParaProcesar(string mensaje);
 
         const int PUERTO = 50000; // El puerto del servidor C
-        IPAddress ip = IPAddress.Parse("10.4.119.6");    //Para Shiva (o la VM) poned aquí su IP
+        IPAddress ip = IPAddress.Parse("10.4.119.5");    //Para Shiva (o la VM) poned aquí su IP
 
         //Tamaño del tablero (tiene que ser igual que COLUMNAS y FILAS del servidor)
         const int COLUMNAS = 30;
