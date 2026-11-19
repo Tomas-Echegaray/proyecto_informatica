@@ -823,7 +823,7 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 	//Conectamos con lo creado								Tabla
-	conn = mysql_real_connect(conn, "localhost", "root", "mysql", "Zombie", 0, NULL, 0);
+	conn = mysql_real_connect(conn, "10.4.119.6", "root", "mysql", "Zombie", 0, NULL, 0);
 	if (conn == NULL)	//Proteccion
 	{
 		printf("Error al iniciar la conexion con MySQL (esta arrancado? existe la base Zombie? la contrasena es 'mysql'?)\n");
